@@ -5,7 +5,7 @@ fn main() {
     let mut nv = nvram_parse(&bytes).expect("parse nvram");
     let var = nv.active_part_mut().get_variable(b"BluetoothInfo", VarType::System).expect("BluetoothInfo");
     let bytes = var.value();
-    let mut data = bytes.as_slice();
+    let mut data: &[u8] = bytes.as_ref();
     while !data.is_empty() {
         assert!(data.len() >= 2, "truncated header");
         let tag = data[0];
