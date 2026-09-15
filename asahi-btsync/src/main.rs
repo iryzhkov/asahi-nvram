@@ -17,6 +17,9 @@ use ini::Ini;
 
 pub mod dbus;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 enum Error {
@@ -56,7 +59,10 @@ impl From<std::array::TryFromSliceError> for Error {
 type Result<T> = std::result::Result<T, Error>;
 
 fn main() {
-    real_main().unwrap();
+    if let Err(error) = real_main() {
+        eprintln!("asahi-btsync: {error:?}");
+        std::process::exit(1);
+    }
 }
 
 fn real_main() -> Result<()> {
@@ -93,21 +99,20 @@ fn real_main() -> Result<()> {
 
     match matches.subcommand() {
         Some(("list", _args)) => {
-            print_btkeys(bt_devs, ble_devs).expect("Failed to parse bt device info");
+            print_btkeys(bt_devs, ble_devs)?;
         }
         Some(("sync", args)) => {
             sync_btkeys(
                 bt_devs,
                 ble_devs,
                 args.get_one::<String>("config").unwrap_or(&default_config),
-            )
-            .expect("Failed to sync bt device info");
+            )?;
         }
         Some(("dump", _args)) => {
             dump(bt_devs).expect("Failed to dump bt device info");
         }
         _ => {
-            print_btkeys(bt_devs, ble_devs).expect("Failed to parse bt device info");
+            print_btkeys(bt_devs, ble_devs)?;
         }
     }
     Ok(())
@@ -198,67 +203,78 @@ fn parse_bt_device(input: &mut &[u8]) -> Result<BtDevice> {
 }
 
 fn parse_ble_info(var: &dyn Variable) -> Result<Vec<BleDevice>> {
+    parse_ble_data(&var.value())
+}
+
+// Apple encodes small integer values compactly, including EDIV and Rand.
+fn ble_integer<const N: usize>(value: &[u8]) -> Result<[u8; N]> {
+    if value.is_empty() || value.len() > N {
+        return Err(Error::Parse);
+    }
+    let mut bytes = [0; N];
+    bytes[..value.len()].copy_from_slice(value);
+    Ok(bytes)
+}
+
+fn parse_ble_data(mut data: &[u8]) -> Result<Vec<BleDevice>> {
     let mut devices = Vec::new();
-    let data = &mut &*var.value();
     if data.is_empty() {
         return Ok(devices);
     }
     let mut device = BleDevice::default();
     while !data.is_empty() {
-        let tag = data[0];
-        let length = data[1] as usize;
-        let value;
-        (value, *data) = data[2..].split_at(length);
+        let header = data.get(..2).ok_or(Error::Parse)?;
+        let tag = header[0];
+        let length = header[1] as usize;
+        let value = data.get(2..2 + length).ok_or(Error::Parse)?;
+        data = &data[2 + length..];
         match tag {
             0x2 => {
                 device.name = String::from_utf8_lossy(value).into_owned();
             }
             0x8 => {
-                device.irk.copy_from_slice(value);
+                device.irk = value.try_into()?;
             }
             0xe => {
-                device.mac_type = value[0];
-                device.mac.copy_from_slice(&value[1..]);
+                device.mac_type = *value.first().ok_or(Error::Parse)?;
+                device.mac = value.get(1..).ok_or(Error::Parse)?.try_into()?;
             }
             0x10 => {
-                device.pltk.copy_from_slice(&value[1..]);
+                device.pltk = value.get(1..).ok_or(Error::Parse)?.try_into()?;
             }
             0x5 => {
-                if value.len() == 1 {
-                    device.vendor_id = value[0] as u16
-                } else {
-                    device.vendor_id = u16::from_le_bytes(value.try_into().unwrap());
-                }
+                device.vendor_id = u16::from_le_bytes(ble_integer(value)?);
             }
             0x6 => {
-                device.vendor_source = value[0];
+                device.vendor_source = u8::from_le_bytes(ble_integer(value)?);
             }
             0xf => {
-                devices.push(device);
+                if device.mac != [0; 6] {
+                    devices.push(device);
+                }
                 device = BleDevice::default();
             }
             0x4 => {
-                if value.len() == 1 {
-                    device.product_id = value[0] as u16
-                } else {
-                    device.product_id = u16::from_le_bytes(value.try_into().unwrap());
-                }
+                device.product_id = u16::from_le_bytes(ble_integer(value)?);
             }
             0x9 => {
-                device.ltk.copy_from_slice(&value[1..]);
+                device.ltk = value.get(1..).ok_or(Error::Parse)?.try_into()?;
             }
             0xa => {
-                device.ediv = u16::from_le_bytes(value.try_into().unwrap());
+                device.ediv = u16::from_le_bytes(ble_integer(value)?);
             }
             0xb => {
-                device.rand = u64::from_le_bytes(value.try_into().unwrap());
+                device.rand = u64::from_le_bytes(ble_integer(value)?);
             }
+            0x11 => {} // GAP Appearance; not needed to import pairing keys.
             _ => {
                 eprintln!("WARNING: Unknown BLE pairing data field: {tag:x}")
             }
         }
     }
-    devices.push(device);
+    if device.mac != [0; 6] {
+        devices.push(device);
+    }
 
     Ok(devices)
 }
